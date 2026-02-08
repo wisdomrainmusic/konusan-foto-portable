@@ -33,14 +33,21 @@ def _resolve_sadtalker_python() -> str:
     if primary and Path(primary).exists() and _python_has_torch(primary):
         return primary
 
-    fallback = Path(__file__).resolve().parent / ".venv" / "Scripts" / "python.exe"
-    if fallback.exists() and _python_has_torch(str(fallback)):
-        return str(fallback)
+    # 1) SadTalker'ın kendi venv'i (en doğru)
+    fallback1 = Path(SADTALKER_DIR) / ".venv" / "Scripts" / "python.exe"
+    if fallback1.exists() and _python_has_torch(str(fallback1)):
+        return str(fallback1)
+
+    # 2) UI venv (varsa)
+    fallback2 = Path(__file__).resolve().parent / ".venv" / "Scripts" / "python.exe"
+    if fallback2.exists() and _python_has_torch(str(fallback2)):
+        return str(fallback2)
 
     raise RuntimeError(
         "SadTalker python ortamında 'torch' bulunamadı.\n"
         f"- SADTALKER_PYTHON: {primary}\n"
-        f"- Fallback venv: {fallback}\n\n"
+        f"- Fallback1 (sadtalker): {fallback1}\n"
+        f"- Fallback2 (ui): {fallback2}\n\n"
         "Çözüm: torch içeren python kullanın (venv) veya portable python içine torch kurun."
     )
 
