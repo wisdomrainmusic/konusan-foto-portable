@@ -1,5 +1,7 @@
 Konuşan Foto – Reels Generator
 
+Rtx Pc Planı Yapıldı. Portable bir hale getirildi.
+
 SadTalker + FFmpeg + PyQt6 UI Pipeline
 
 Projenin Amacı
@@ -228,4 +230,5 @@ RTX PC’ye kurulum checklist’i (CUDA torch + aynı checkpoint yapısı).
 Not
 
 Bu proje üretim seviyesine çok yakın bir prototip haline gelmiştir.
+
 Yeni sohbette bu README referans alınarak direkt geliştirmeye devam edilebilir.
