@@ -2,10 +2,47 @@
 import os
 import glob
 import subprocess
+import time
 from pathlib import Path
 from config import *
 import math
 import re
+
+
+def _python_has_torch(python_exe: str) -> bool:
+    try:
+        r = subprocess.run(
+            [python_exe, "-c", "import torch;print(torch.__version__)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _resolve_sadtalker_python() -> str:
+    """
+    Non-breaking:
+    - Önce config.py içindeki SADTALKER_PYTHON denenir.
+    - Torch yoksa otomatik fallback: konusan-ui/.venv/Scripts/python.exe
+    """
+    primary = SADTALKER_PYTHON
+    if primary and Path(primary).exists() and _python_has_torch(primary):
+        return primary
+
+    fallback = Path(__file__).resolve().parent / ".venv" / "Scripts" / "python.exe"
+    if fallback.exists() and _python_has_torch(str(fallback)):
+        return str(fallback)
+
+    raise RuntimeError(
+        "SadTalker python ortamında 'torch' bulunamadı.\n"
+        f"- SADTALKER_PYTHON: {primary}\n"
+        f"- Fallback venv: {fallback}\n\n"
+        "Çözüm: torch içeren python kullanın (venv) veya portable python içine torch kurun."
+    )
 
 
 # -------------------------
@@ -129,6 +166,28 @@ def _newest_temp_mp4(search_root: str) -> str | None:
     return mp4s[-1]
 
 
+def _cleanup_temp_mp4(search_root: str) -> None:
+    """Stale temp mp4 dosyalarını temizler ki eski çıktı yeni sanılmasın."""
+    mp4s = glob.glob(os.path.join(search_root, "**", "*.mp4"), recursive=True)
+    mp4s = [m for m in mp4s if os.path.basename(m).lower().startswith("temp_")]
+    for p in mp4s:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+
+def _newest_temp_mp4_after(search_root: str, t0: float) -> str | None:
+    """t0'dan sonra üretilen en yeni temp_*.mp4"""
+    mp4s = glob.glob(os.path.join(search_root, "**", "*.mp4"), recursive=True)
+    mp4s = [m for m in mp4s if os.path.basename(m).lower().startswith("temp_")]
+    mp4s = [m for m in mp4s if os.path.getmtime(m) >= t0]
+    if not mp4s:
+        return None
+    mp4s.sort(key=lambda p: os.path.getmtime(p))
+    return mp4s[-1]
+
+
 def run_sadtalker(image_path: str, audio_path: str, output_dir: str) -> str:
     """
     SadTalker'ı çalıştırır.
@@ -143,6 +202,14 @@ def run_sadtalker(image_path: str, audio_path: str, output_dir: str) -> str:
     output_dir = str(Path(output_dir).resolve())
     os.makedirs(output_dir, exist_ok=True)
 
+    # ✅ kritik: eski temp videoları sil (stale output bug fix)
+    _cleanup_temp_mp4(output_dir)
+
+    # ✅ doğru python seç (torch kontrol)
+    sadtalker_py = _resolve_sadtalker_python()
+
+    t0 = time.time()
+
     work_dir = str(Path(output_dir) / "_tmp_audio")
     os.makedirs(work_dir, exist_ok=True)
 
@@ -152,7 +219,7 @@ def run_sadtalker(image_path: str, audio_path: str, output_dir: str) -> str:
     # 2) Tek parça render dene
     def _run_once(driven_audio: str, out_dir: str) -> tuple[str | None, str]:
         cmd = [
-            SADTALKER_PYTHON,
+            sadtalker_py,
             "inference.py",
             "--driven_audio", str(Path(driven_audio).resolve()),
             "--source_image", str(Path(image_path).resolve()),
@@ -180,9 +247,9 @@ def run_sadtalker(image_path: str, audio_path: str, output_dir: str) -> str:
             errors="replace",
         )
 
-        found = _newest_temp_mp4(out_dir)
+        found = _newest_temp_mp4_after(out_dir, t0)
         if not found:
-            found = _newest_temp_mp4(os.path.join(SADTALKER_DIR, out_dir))
+            found = _newest_temp_mp4_after(os.path.join(SADTALKER_DIR, out_dir), t0)
         return found, (p.stdout or "")
 
     found, log_text = _run_once(norm_audio, output_dir)
