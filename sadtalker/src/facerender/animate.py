@@ -218,7 +218,22 @@ class AnimateFromCoeff():
 
         return checkpoint['epoch']
 
-    def generate(self, x, video_save_dir, pic_path, crop_info, enhancer=None, background_enhancer=None, preprocess='crop'):
+    def generate(
+        self,
+        x,
+        video_save_dir,
+        pic_path,
+        crop_info,
+        enhancer=None,
+        background_enhancer=None,
+        preprocess='crop',
+        img_size=None,
+        **kwargs
+    ):
+        # Backward/forward compatibility:
+        # - Some forks pass img_size or other keyword args. We ignore if not used here.
+        _ = img_size
+        _ = kwargs
         source_image = x['source_image'].type(torch.FloatTensor)
         source_semantics = x['source_semantics'].type(torch.FloatTensor)
         target_semantics = x['target_semantics_list'].type(torch.FloatTensor)
