@@ -191,7 +191,24 @@ class AnimateFromCoeff():
         checkpoint = torch.load(checkpoint_path, map_location=torch.device(device))
 
         if mapping is not None:
-            mapping.load_state_dict(checkpoint['mapping'])
+            state = checkpoint.get('mapping', checkpoint)
+            model_state = mapping.state_dict()
+            # Filter out keys with mismatched shapes (e.g., 73 vs 70 input channels)
+            filtered = {}
+            skipped = []
+            for k, v in state.items():
+                if k in model_state and hasattr(v, "shape") and hasattr(model_state[k], "shape"):
+                    if tuple(v.shape) != tuple(model_state[k].shape):
+                        skipped.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+                        continue
+                filtered[k] = v
+            missing, unexpected = mapping.load_state_dict(filtered, strict=False)
+            if skipped:
+                print("[WARN] MappingNet: skipped mismatched keys:")
+                for k, a, b in skipped[:10]:
+                    print(f"  - {k}: ckpt{a} != model{b}")
+                if len(skipped) > 10:
+                    print(f"  ... and {len(skipped)-10} more")
         if discriminator is not None:
             discriminator.load_state_dict(checkpoint['discriminator'])
         if optimizer_mapping is not None:
