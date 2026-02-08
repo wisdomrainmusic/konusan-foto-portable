@@ -65,6 +65,20 @@ def get_rotation_matrix(yaw, pitch, roll):
 def keypoint_transformation(kp_canonical, he, wo_exp=False):
     kp = kp_canonical['value']    # (bs, k, 3) 
     yaw, pitch, roll= he['yaw'], he['pitch'], he['roll']      
+    # 🔒 GPU portability guard
+    def _ensure_tensor(x):
+        if isinstance(x, str):
+            try:
+                x = eval(x)
+            except Exception:
+                pass
+        if not torch.is_tensor(x):
+            x = torch.tensor(x)
+        return x
+
+    yaw = _ensure_tensor(yaw)
+    pitch = _ensure_tensor(pitch)
+    roll = _ensure_tensor(roll)
     yaw = headpose_pred_to_degree(yaw) 
     pitch = headpose_pred_to_degree(pitch)
     roll = headpose_pred_to_degree(roll)
