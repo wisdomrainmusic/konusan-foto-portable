@@ -1,8 +1,16 @@
+import os
+import sys
+
+# ✅ Force SadTalker repo root (folder containing this file) into sys.path
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 from glob import glob
 import shutil
 import torch
 from time import  strftime
-import os, sys, time
+import time
 from argparse import ArgumentParser
 
 from src.utils.preprocess import CropAndExtract
