@@ -4,6 +4,120 @@ import glob
 import subprocess
 from pathlib import Path
 from config import *
+import math
+import re
+
+
+# -------------------------
+# Audio helpers (non-breaking)
+# -------------------------
+
+def _ffprobe_path() -> str:
+    # ffprobe is usually shipped next to ffmpeg
+    ffmpeg = Path(FFMPEG_PATH)
+    cand = ffmpeg.with_name("ffprobe.exe") if ffmpeg.suffix.lower() == ".exe" else ffmpeg.with_name("ffprobe")
+    return str(cand)
+
+def _probe_duration_seconds(media_path: str) -> float | None:
+    """Return duration in seconds (float). None if unknown."""
+    media_path = str(Path(media_path).resolve())
+    ffprobe = _ffprobe_path()
+    try:
+        if Path(ffprobe).exists():
+            p = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", media_path],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                check=False
+            )
+            s = (p.stdout or "").strip()
+            return float(s) if s else None
+    except Exception:
+        pass
+
+    # fallback: parse ffmpeg -i output
+    try:
+        p = subprocess.run(
+            [FFMPEG_PATH, "-i", media_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+            check=False
+        )
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", p.stdout or "")
+        if not m:
+            return None
+        hh, mm, ss = m.groups()
+        return int(hh) * 3600 + int(mm) * 60 + float(ss)
+    except Exception:
+        return None
+
+def _normalize_audio_to_wav16k(audio_path: str, work_dir: str) -> str:
+    """SadTalker için sesi garanti formatta hazırlar: mono, 16kHz, PCM wav."""
+    work_dir = str(Path(work_dir).resolve())
+    os.makedirs(work_dir, exist_ok=True)
+    out_wav = str(Path(work_dir) / "driven_audio_16k_mono.wav")
+
+    cmd = [
+        FFMPEG_PATH, "-y",
+        "-i", str(Path(audio_path).resolve()),
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-c:a", "pcm_s16le",
+        out_wav
+    ]
+    subprocess.run(cmd, check=True)
+    return out_wav
+
+def _split_wav_into_chunks(wav_path: str, chunk_seconds: int, work_dir: str) -> list[str]:
+    """wav'ı ffmpeg ile parçalara böler (ss/t)."""
+    dur = _probe_duration_seconds(wav_path) or 0.0
+    if dur <= 0:
+        return [wav_path]
+
+    n = int(math.ceil(dur / float(chunk_seconds)))
+    chunks = []
+    for i in range(n):
+        ss = i * chunk_seconds
+        t = min(chunk_seconds, max(0.0, dur - ss))
+        out = str(Path(work_dir) / f"chunk_{i:03d}.wav")
+        cmd = [
+            FFMPEG_PATH, "-y",
+            "-ss", str(ss),
+            "-t", str(t),
+            "-i", str(Path(wav_path).resolve()),
+            "-vn",
+            "-ac", "1",
+            "-ar", "16000",
+            "-c:a", "pcm_s16le",
+            out
+        ]
+        subprocess.run(cmd, check=True)
+        chunks.append(out)
+    return chunks
+
+def _concat_videos(video_paths: list[str], out_path: str) -> str:
+    """Video parçalarını tek videoda birleştirir (audio yok)."""
+    out_path = str(Path(out_path).resolve())
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    # concat filter (re-encode) -> en güvenlisi
+    inputs = []
+    for vp in video_paths:
+        inputs += ["-i", str(Path(vp).resolve())]
+
+    filter_complex = f"concat=n={len(video_paths)}:v=1:a=0,format=yuv420p[v]"
+    cmd = [
+        FFMPEG_PATH, "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", "[v]",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        out_path
+    ]
+    subprocess.run(cmd, check=True)
+    return out_path
 
 
 def _newest_temp_mp4(search_root: str) -> str | None:
@@ -20,51 +134,99 @@ def run_sadtalker(image_path: str, audio_path: str, output_dir: str) -> str:
     SadTalker'ı çalıştırır.
     Not: Bazı ortamlarda enhancer='none' yüzünden SadTalker en sonda exit 1 dönebiliyor,
     ama video üretmiş oluyor. Bu yüzden check=True kullanmıyoruz; çıktı var mı diye bakıyoruz.
+
+    ✅ Non-breaking iyileştirme:
+    - MP3/WAV fark etmez: sesi 16kHz mono PCM WAV'a çevirip SadTalker'a öyle verir.
+    - Eğer SadTalker çıktısı sesin sadece ilk ~6 saniyesini kapsıyorsa (tipik truncation),
+      otomatik olarak sesi parçalara bölüp (chunk) her parçayı ayrı renderlar ve videoları birleştirir.
     """
     output_dir = str(Path(output_dir).resolve())
     os.makedirs(output_dir, exist_ok=True)
 
-    cmd = [
-        SADTALKER_PYTHON,
-        "inference.py",
-        "--driven_audio", str(Path(audio_path).resolve()),
-        "--source_image", str(Path(image_path).resolve()),
-        "--result_dir", output_dir,
+    work_dir = str(Path(output_dir) / "_tmp_audio")
+    os.makedirs(work_dir, exist_ok=True)
 
-        # ✅ omuz/kafa hareketini minimum
-        "--still",
-        "--preprocess", "full",
+    # 1) Audio'yu garanti formata getir
+    norm_audio = _normalize_audio_to_wav16k(audio_path, work_dir)
 
-        # ✅ kalite
-        "--size", "512",
+    # 2) Tek parça render dene
+    def _run_once(driven_audio: str, out_dir: str) -> tuple[str | None, str]:
+        cmd = [
+            SADTALKER_PYTHON,
+            "inference.py",
+            "--driven_audio", str(Path(driven_audio).resolve()),
+            "--source_image", str(Path(image_path).resolve()),
+            "--result_dir", out_dir,
 
-        # ✅ enhancer kapalı
-        "--enhancer", "none",
-    ]
+            # ✅ omuz/kafa hareketini minimum
+            "--still",
+            "--preprocess", "full",
 
-    p = subprocess.run(
-        cmd,
-        cwd=SADTALKER_DIR,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+            # ✅ kalite
+            "--size", "512",
 
-    found = _newest_temp_mp4(output_dir)
-    if found:
+            # ✅ enhancer kapalı
+            "--enhancer", "none",
+        ]
+
+        p = subprocess.run(
+            cmd,
+            cwd=SADTALKER_DIR,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        found = _newest_temp_mp4(out_dir)
+        if not found:
+            found = _newest_temp_mp4(os.path.join(SADTALKER_DIR, out_dir))
+        return found, (p.stdout or "")
+
+    found, log_text = _run_once(norm_audio, output_dir)
+    if not found:
+        tail = log_text[-2000:]
+        raise RuntimeError(
+            f"SadTalker çıktı üretmedi.\n\n--- log tail ---\n{tail}"
+        )
+
+    # 3) Truncation kontrolü (video, audio'dan bariz kısa mı?)
+    a_dur = _probe_duration_seconds(norm_audio)
+    v_dur = _probe_duration_seconds(found)
+
+    # Eğer süreleri ölçemediysek, mevcut davranışı bozmayalım: direkt döndür.
+    if not a_dur or not v_dur:
         return found
 
-    alt = _newest_temp_mp4(os.path.join(SADTALKER_DIR, output_dir))
-    if alt:
-        return alt
+    # Tipik bug: ~6s video, uzun audio. Burada otomatik chunk mode'a geç.
+    if a_dur > 7.5 and v_dur < (a_dur - 1.0):
+        # 1 dakikaya kadar hedef için: 15s chunk iyi denge (4 parça)
+        chunks = _split_wav_into_chunks(norm_audio, chunk_seconds=15, work_dir=work_dir)
+        chunk_videos: list[str] = []
 
-    tail = (p.stdout or "")[-2000:]
-    raise RuntimeError(
-        f"SadTalker çıktı üretmedi. returncode={p.returncode}\n\n--- log tail ---\n{tail}"
-    )
+        for i, chunk in enumerate(chunks):
+            chunk_out_dir = str(Path(output_dir) / f"_chunk_{i:03d}")
+            os.makedirs(chunk_out_dir, exist_ok=True)
+            v, chunk_log = _run_once(chunk, chunk_out_dir)
+            if not v:
+                tail = chunk_log[-2000:]
+                raise RuntimeError(
+                    f"SadTalker chunk çıktı üretmedi (chunk {i}).\n\n--- log tail ---\n{tail}"
+                )
+            # concat kolaylığı için: her chunk videodan audio'yu çıkar
+            v_no_audio = str(Path(chunk_out_dir) / "temp_no_audio.mp4")
+            subprocess.run(
+                [FFMPEG_PATH, "-y", "-i", v, "-an", "-c:v", "copy", v_no_audio],
+                check=True
+            )
+            chunk_videos.append(v_no_audio)
+
+        merged = str(Path(output_dir) / "temp_merged.mp4")
+        return _concat_videos(chunk_videos, merged)
+
+    return found
 
 
 def make_reels(video_path: str, audio_path: str, reels_path: str) -> str:
