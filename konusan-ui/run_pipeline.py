@@ -236,9 +236,13 @@ def run_sadtalker(image_path: str, audio_path: str, output_dir: str) -> str:
             "--enhancer", "none",
         ]
 
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(SADTALKER_DIR).resolve()) + os.pathsep + env.get("PYTHONPATH", "")
+
         p = subprocess.run(
             cmd,
             cwd=SADTALKER_DIR,
+            env=env,
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
