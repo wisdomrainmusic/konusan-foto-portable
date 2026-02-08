@@ -29,7 +29,62 @@ def _lazy_face_enhancer():
 
 class AnimateFromCoeff():
 
-    def __init__(self, free_view_checkpoint, mapping_checkpoint, config_path, device):
+    def __init__(self, *args, **kwargs):
+        """
+        Backward compatible init.
+        Supports:
+          1) AnimateFromCoeff(sadtalker_paths: dict, device)
+          2) AnimateFromCoeff(free_view_ckpt, mapping_ckpt, config_path, device)
+        """
+        if len(args) == 2 and isinstance(args[0], dict):
+            sadtalker_paths = args[0]
+            device = args[1]
+
+            free_view_checkpoint = (
+                sadtalker_paths.get("free_view_checkpoint")
+                or sadtalker_paths.get("facevid2vid_checkpoint")
+                or sadtalker_paths.get("facerender_checkpoint")
+                or sadtalker_paths.get("checkpoint_path")
+            )
+            mapping_checkpoint = (
+                sadtalker_paths.get("mapping_checkpoint")
+                or sadtalker_paths.get("mappingnet_checkpoint")
+            )
+            config_path = (
+                sadtalker_paths.get("config_path")
+                or sadtalker_paths.get("facerender_config")
+                or sadtalker_paths.get("config")
+            )
+
+            if not config_path:
+                cand = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "..",
+                    "config",
+                    "facerender.yaml",
+                )
+                cand = os.path.abspath(cand)
+                if os.path.exists(cand):
+                    config_path = cand
+
+            if not free_view_checkpoint or not mapping_checkpoint or not config_path:
+                raise RuntimeError(
+                    "AnimateFromCoeff init: required paths missing.\n"
+                    f"free_view_checkpoint={free_view_checkpoint}\n"
+                    f"mapping_checkpoint={mapping_checkpoint}\n"
+                    f"config_path={config_path}\n"
+                    "Provided keys:\n"
+                    + "\n".join(sorted(list(sadtalker_paths.keys())))
+                )
+        elif len(args) == 4:
+            free_view_checkpoint, mapping_checkpoint, config_path, device = args
+        else:
+            raise TypeError(
+                "AnimateFromCoeff expected (paths_dict, device) or "
+                "(free_view_ckpt, mapping_ckpt, config_path, device). "
+                f"Got args={args}"
+            )
+
         with open(config_path) as f:
             config = yaml.safe_load(f)
 
