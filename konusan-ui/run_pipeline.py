@@ -172,6 +172,52 @@ def _newest_temp_mp4(search_root: str) -> str | None:
     mp4s.sort(key=lambda p: os.path.getmtime(p))
     return mp4s[-1]
 
+def _newest_output_mp4_after(search_root: str, t0: float) -> str | None:
+    """SadTalker'ın ürettiği en yeni mp4'ü bul.
+
+    Not: Bazı SadTalker sürümleri çıktıyı `temp_*.mp4` yerine `<timestamp>.mp4`
+    olarak yazar. Bu yüzden sadece temp_ aramak false-negative üretebilir.
+    """
+    mp4s = glob.glob(os.path.join(search_root, "**", "*.mp4"), recursive=True)
+    mp4s = [m for m in mp4s if os.path.getmtime(m) >= t0]
+
+    # bizim ürettiğimiz yan çıktıları filtrele
+    skip_names = {"reels.mp4", "temp_no_audio.mp4", "temp_merged.mp4"}
+    mp4s = [m for m in mp4s if os.path.basename(m).lower() not in skip_names]
+
+    # crash sonrası 0-byte dosyaları ele
+    mp4s = [m for m in mp4s if os.path.getsize(m) > 0]
+
+    if not mp4s:
+        return None
+    mp4s.sort(key=lambda p: os.path.getmtime(p))
+    return mp4s[-1]
+
+def _parse_audio2exp_total_frames(log_text: str) -> int | None:
+    """SadTalker stdout içinden audio2exp toplam frame sayısını yakalar.
+    Örn: `audio2exp: 100%|##########| 92/92 [..]`
+    """
+    matches = re.findall(r"audio2exp:\s*\d+%.*?\|\s*(\d+)/(\d+)\s*\[", log_text or "")
+    if not matches:
+        matches = re.findall(r"audio2exp:.*?(\d+)/(\d+)", log_text or "")
+    if not matches:
+        return None
+    done, total = matches[-1]
+    try:
+        return int(total)
+    except Exception:
+        return None
+
+def _should_force_chunking(audio_seconds: float | None, log_text: str) -> bool:
+    """6 saniye dudak gibi truncation durumlarını yakalamak için heuristik."""
+    if not audio_seconds:
+        return False
+    total_frames = _parse_audio2exp_total_frames(log_text)
+    if not total_frames:
+        return False
+    approx_seconds = total_frames / 25.0  # SadTalker çoğunlukla ~25fps
+    return (audio_seconds > 10.0) and (approx_seconds < (audio_seconds * 0.6))
+
 
 def _cleanup_temp_mp4(search_root: str) -> None:
     """Stale temp mp4 dosyalarını temizler ki eski çıktı yeni sanılmasın."""
@@ -223,8 +269,22 @@ def run_sadtalker(image_path: str, audio_path: str, output_dir: str) -> str:
     # 1) Audio'yu garanti formata getir
     norm_audio = _normalize_audio_to_wav16k(audio_path, work_dir)
 
-    # 2) Tek parça render dene
-    def _run_once(driven_audio: str, out_dir: str) -> tuple[str | None, str]:
+    # 1.b) Checkpoint klasörü hızlı doğrula (portable paketlerde en sık hata)
+    ckpt_dir = Path(SADTALKER_DIR) / "checkpoints"
+    if not ckpt_dir.exists():
+        raise RuntimeError(
+            "SadTalker checkpoints klasörü bulunamadı:\n"
+            f"- Beklenen: {ckpt_dir}\n\n"
+            "Çözüm: SadTalker model dosyalarını (checkpoints/...) bu klasöre kopyalayın."
+        )
+
+    # 2) Render helper (tek deneme)
+    def _run_once(
+        driven_audio: str,
+        out_dir: str,
+        size: int,
+        old_version: bool,
+    ) -> tuple[str | None, str]:
         cmd = [
             sadtalker_py,
             "inference.py",
@@ -237,11 +297,14 @@ def run_sadtalker(image_path: str, audio_path: str, output_dir: str) -> str:
             "--preprocess", "full",
 
             # ✅ kalite
-            "--size", "512",
+            "--size", str(size),
 
             # ✅ enhancer kapalı
             "--enhancer", "none",
         ]
+
+        if old_version:
+            cmd.append("--old_version")
 
         env = os.environ.copy()
         env["PYTHONPATH"] = str(Path(SADTALKER_DIR).resolve()) + os.pathsep + env.get("PYTHONPATH", "")
@@ -258,20 +321,56 @@ def run_sadtalker(image_path: str, audio_path: str, output_dir: str) -> str:
             errors="replace",
         )
 
-        found = _newest_temp_mp4_after(out_dir, t0)
+        # Debug için log'u diske yaz (UI crash olsa bile kalsın)
+        try:
+            logs_dir = Path(out_dir) / "_logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            (logs_dir / f"sadtalker_{stamp}_size{size}{'_old' if old_version else ''}.log").write_text(
+                p.stdout or "", encoding="utf-8", errors="replace"
+            )
+        except Exception:
+            pass
+
+        # SadTalker çıktısı: temp_*.mp4 VEYA <timestamp>.mp4 olabilir
+        found = _newest_output_mp4_after(out_dir, t0)
         if not found:
-            found = _newest_temp_mp4_after(os.path.join(SADTALKER_DIR, out_dir), t0)
+            found = _newest_output_mp4_after(os.path.join(SADTALKER_DIR, out_dir), t0)
         return found, (p.stdout or "")
 
-    found, log_text = _run_once(norm_audio, output_dir)
+    def _looks_like_checkpoint_mismatch(log_text: str) -> bool:
+        needles = ["skipped mismatched keys", "adapted input_3dmm", "load_state_dict", "size mismatch"]
+        t = (log_text or "").lower()
+        return any(n in t for n in needles)
+
+    # 2.a) Akıllı retry: checkpoint/versiyon uyumsuzluğu için
+    a_dur = _probe_duration_seconds(norm_audio)
+    attempts = [(512, False), (512, True), (256, False), (256, True)]
+    found = None
+    log_text = ""
+    used_size = 512
+    used_old_version = False
+
+    for size, old_version in attempts:
+        found, log_text = _run_once(norm_audio, output_dir, size=size, old_version=old_version)
+        if found:
+            used_size = size
+            used_old_version = old_version
+            break
+        if not _looks_like_checkpoint_mismatch(log_text):
+            break
+
     if not found:
-        tail = log_text[-2000:]
+        tail = (log_text or "")[-2200:]
         raise RuntimeError(
-            f"SadTalker çıktı üretmedi.\n\n--- log tail ---\n{tail}"
+            "SadTalker çıktı üretmedi.\n"
+            "\n--- log tail ---\n"
+            f"{tail}\n\n"
+            "İpucu: Bu hata genellikle yanlış/eksik checkpoint (./sadtalker/checkpoints) veya\n"
+            "(size=256/512) model uyumsuzluğundan gelir. Checkpoints klasörünü doğrulayın."
         )
 
-    # 3) Truncation kontrolü (video, audio'dan bariz kısa mı?)
-    a_dur = _probe_duration_seconds(norm_audio)
+    # 3) Truncation kontrolü
     v_dur = _probe_duration_seconds(found)
 
     # Eğer süreleri ölçemediysek, mevcut davranışı bozmayalım: direkt döndür.
@@ -279,7 +378,10 @@ def run_sadtalker(image_path: str, audio_path: str, output_dir: str) -> str:
         return found
 
     # Tipik bug: ~6s video, uzun audio. Burada otomatik chunk mode'a geç.
-    if a_dur > 7.5 and v_dur < (a_dur - 1.0):
+    too_short_video = (a_dur and v_dur and a_dur > 7.5 and v_dur < (a_dur - 1.0))
+    looks_like_6s_lip = _should_force_chunking(a_dur, log_text)
+
+    if too_short_video or looks_like_6s_lip:
         # 1 dakikaya kadar hedef için: 15s chunk iyi denge (4 parça)
         chunks = _split_wav_into_chunks(norm_audio, chunk_seconds=15, work_dir=work_dir)
         chunk_videos: list[str] = []
@@ -287,7 +389,7 @@ def run_sadtalker(image_path: str, audio_path: str, output_dir: str) -> str:
         for i, chunk in enumerate(chunks):
             chunk_out_dir = str(Path(output_dir) / f"_chunk_{i:03d}")
             os.makedirs(chunk_out_dir, exist_ok=True)
-            v, chunk_log = _run_once(chunk, chunk_out_dir)
+            v, chunk_log = _run_once(chunk, chunk_out_dir, size=used_size, old_version=used_old_version)
             if not v:
                 tail = chunk_log[-2000:]
                 raise RuntimeError(

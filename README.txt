@@ -22,8 +22,9 @@ Tüm süreç tek tıkla çalışan bir UI üzerinden yürütülür.
 Genel Mimari
 konusan-foto/
 │
-├─ sadtalker/              # SadTalker repo (orijinal)
-│   └─ inference.py
+├─ sadtalker/              # SadTalker repo
+│   ├─ inference.py
+│   └─ checkpoints/         # ✅ model dosyaları burada olmalı
 │
 ├─ konusan-ui/             # UI + pipeline
 │   ├─ ui_app.py
@@ -36,9 +37,9 @@ konusan-foto/
 │   └─ audio.wav
 │
 ├─ output_ui/
-│   └─ YYYY_MM_DD_xx.xx.xx/
-│       ├─ temp_*.mp4
-│       └─ reels.mp4
+│   ├─ <timestamp>.mp4      # SadTalker çıktısı (bazı sürümlerde temp_*.mp4 olabilir)
+│   ├─ reels.mp4
+│   └─ _logs/               # SadTalker stdout logları
 │
 └─ ffmpeg/
     └─ ffmpeg.exe
